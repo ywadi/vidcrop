@@ -1,466 +1,395 @@
 import cv2
 import numpy as np
 import mediapipe as mp
-import argparse
-import sys
-import logging
-import os
 import ffmpeg
+import sys
+import argparse
+import logging
+import time
 
-# Configure logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('/data/video_to_shorts.log'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger(__name__)
+# --- Setup Logging ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Initialize MediaPipe Face Detection
-mp_face_detection = mp.solutions.face_detection
-face_detection = mp_face_detection.FaceDetection(min_detection_confidence=0.4)
+class VideoProcessor:
+    """
+    A class to handle the core logic of detecting faces and cropping a video
+    to a 9:16 aspect ratio, with smoothed, stabilized camera motion and glitch-free layout changes.
+    """
 
-# Constants
-ASPECT_RATIO = 9 / 16  # 9:16 for shorts
-OUTPUT_WIDTH = 1080
-OUTPUT_HEIGHT = 1920
-MARGIN_FACTOR = 0.1  # 10% margin around faces
-SMOOTHING_ALPHA = 0.3  # Smoothing factor for crop transitions
-BITRATE = "5000k"
-DETECTION_INTERVAL = 3  # Detect faces every 3rd frame
-BLUR_KERNEL = (21, 21)  # Gaussian blur kernel
-DARKEN_FACTOR = 0.5  # Darken blurred background to 50% brightness
+    def __init__(self, input_path, output_path, smoothing_factor=0.07, inertia_zone=0.7, enter_threshold=5, exit_threshold=15, debug_mode=False, upscale_factor=1.0, confidence=0.5, scene_cut_threshold=0.99):
+        """
+        Initializes the VideoProcessor.
 
-def preprocess_frame(frame):
-    """Apply histogram equalization to improve face detection."""
-    logger.debug("Preprocessing frame for face detection")
-    ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
-    y, cr, cb = cv2.split(ycrcb)
-    y_eq = cv2.equalizeHist(y)
-    ycrcb_eq = cv2.merge((y_eq, cr, cb))
-    return cv2.cvtColor(ycrcb_eq, cv2.COLOR_YCrCb2RGB)
+        Args:
+            input_path (str): Path to the input video file.
+            output_path (str): Path to save the output video file.
+            smoothing_factor (float): Factor for smoothing camera motion (0-1). Lower is smoother.
+            inertia_zone (float): Percentage of the frame to use as a 'dead zone' for movement (0-1).
+            enter_threshold (int): Frames to confirm a new mode before switching.
+            exit_threshold (int): Frames to wait before exiting a mode after faces are lost.
+            debug_mode (bool): If True, draws bounding boxes around detected faces.
+            upscale_factor (float): Factor to upscale frames before detection (e.g., 1.5).
+            confidence (float): Minimum detection confidence for MediaPipe.
+            scene_cut_threshold (float): Correlation threshold for scene cut detection (0.0-1.0). Lower is more sensitive.
+        """
+        if not input_path or not output_path:
+            raise ValueError("Input and output paths cannot be None.")
+            
+        self.input_path = input_path
+        self.output_path = output_path
+        self.smoothing_factor = smoothing_factor
+        self.inertia_zone = inertia_zone
+        self.enter_threshold = enter_threshold
+        self.exit_threshold = exit_threshold
+        self.debug_mode = debug_mode
+        self.upscale_factor = upscale_factor
+        self.scene_cut_threshold = scene_cut_threshold
+        
+        # --- Video Properties ---
+        self.cap = cv2.VideoCapture(input_path)
+        if not self.cap.isOpened():
+            raise IOError(f"Error opening video file: {input_path}")
+            
+        self.original_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.original_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-def get_face_bboxes(frame):
-    """Detect faces in a frame and return bounding boxes in pixel coordinates."""
-    logger.debug("Detecting faces in frame")
-    rgb_frame = preprocess_frame(frame)
-    results = face_detection.process(rgb_frame)
-    bboxes = []
-    if results.detections:
-        height, width = frame.shape[:2]
-        for detection in results.detections:
-            bbox = detection.location_data.relative_bounding_box
-            x_min = int(bbox.xmin * width)
-            y_min = int(bbox.ymin * height)
-            w = int(bbox.width * width)
-            h = int(bbox.height * height)
-            x_max = x_min + w
-            y_max = y_min + h
-            # Clamp coordinates
-            x_min = max(0, x_min)
-            y_min = max(0, y_min)
-            x_max = min(width, x_max)
-            y_max = min(height, y_max)
-            confidence = detection.score[0]
-            bboxes.append((x_min, y_min, x_max, y_max))
-            logger.debug(f"Face detected with confidence {confidence:.2f}: ({x_min}, {y_min}, {x_max}, {y_max})")
-    logger.info(f"Detected {len(bboxes)} faces")
-    return bboxes
+        # --- Output Configuration ---
+        self.output_aspect_ratio = 9 / 16
+        self.output_height = 1920
+        self.output_width = int(self.output_height * self.output_aspect_ratio)
 
-def compute_crop_1_face(bbox, frame_shape, prev_crops, prev_face_count):
-    """Compute crop for a single face, resetting if previous crop was for no faces."""
-    logger.debug("Computing crop for 1 face")
-    frame_w, frame_h = frame_shape
-    x_min, y_min, x_max, y_max = bbox
-    x_center = (x_min + x_max) // 2
-    y_center = (y_min + y_max) // 2
+        # --- MediaPipe Initialization ---
+        self.mp_face_detection = mp.solutions.face_detection
+        self.face_detection = self.mp_face_detection.FaceDetection(
+            model_selection=1, min_detection_confidence=confidence
+        )
 
-    # Calculate crop dimensions (target 9:16 but preserve input aspect for scaling)
-    crop_h = min(frame_h, int(frame_w / ASPECT_RATIO))
-    crop_w = int(crop_h * ASPECT_RATIO)
-    margin_w = int(crop_w * MARGIN_FACTOR)
-    margin_h = int(crop_h * MARGIN_FACTOR)
+        # --- State for Logic ---
+        self.active_mode = 'general'
+        self.candidate_mode = 'general'
+        self.mode_confirmation_counter = 0
+        self.last_face_count = 0
+        self.last_general_crop_box = None
+        self.last_top_crop_box = None
+        self.last_bottom_crop_box = None
+        self.prev_frame_hist = None # For scene cut detection
 
-    # Expand bounding box with margin
-    x_min = max(0, x_min - margin_w)
-    x_max = min(frame_w, x_max + margin_w)
-    y_min = max(0, y_min - margin_h)
-    y_max = min(frame_h, y_max + margin_h)
+        logging.info("VideoProcessor initialized.")
+        logging.info(f"Smoothing: {self.smoothing_factor}, Inertia: {self.inertia_zone}, Confidence: {confidence}")
+        if self.scene_cut_threshold < 1.0:
+            logging.info(f"Scene cut detection enabled with threshold: {self.scene_cut_threshold}")
+        if self.upscale_factor > 1.0:
+            logging.info(f"Detection frame upscale factor: {self.upscale_factor}")
+        if self.debug_mode:
+            logging.warning("DEBUG MODE ENABLED: Bounding boxes will be drawn on the output video.")
 
-    # Check if previous crop exists and is not a full-frame crop (from no faces)
-    if (prev_crops and len(prev_crops) > 0 and isinstance(prev_crops[0], tuple) and
-            prev_face_count > 0 and prev_crops[0] != (0, 0, frame_w, frame_h)):
-        px_min, py_min, px_max, py_max = prev_crops[0]
-        if (x_min >= px_min and x_max <= px_max and
-                y_min >= py_min and y_max <= py_max):
-            logger.debug("Reusing previous crop for 1 face")
-            return [prev_crops[0]], False
+    def _detect_scene_cut(self, frame, frame_number):
+        """Detects a scene cut by comparing color histograms of consecutive frames."""
+        if frame_number == 0:
+            hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            self.prev_frame_hist = cv2.calcHist([hsv_frame], [0, 1], None, [50, 60], [0, 180, 0, 256])
+            cv2.normalize(self.prev_frame_hist, self.prev_frame_hist, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+            return False
 
-    # Compute new crop centered on face
-    x_crop = x_center - crop_w // 2
-    y_crop = y_center - crop_h // 2
-    x_crop = max(0, min(frame_w - crop_w, x_crop))
-    y_crop = max(0, min(frame_h - crop_h, y_crop))
-    crop = (x_crop, y_crop, x_crop + crop_w, y_crop + crop_h)
-    logger.debug(f"New crop for 1 face: {crop}")
-    if prev_face_count == 0:
-        logger.debug("Reset crop due to transition from no faces to 1 face")
-    return [crop], True
+        hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        current_hist = cv2.calcHist([hsv_frame], [0, 1], None, [50, 60], [0, 180, 0, 256])
+        cv2.normalize(current_hist, current_hist, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
 
-def compute_crop_2_faces(bboxes, frame_shape, prev_crops, prev_face_count):
-    """Compute two crops for two faces, resetting if previous crop was for no faces."""
-    logger.debug("Computing crops for 2 faces")
-    frame_w, frame_h = frame_shape
-    # Sort by x to assign left face to top, right face to bottom
-    bboxes = sorted(bboxes, key=lambda b: b[0])
-    top_bbox, bottom_bbox = bboxes
+        correlation = cv2.compareHist(self.prev_frame_hist, current_hist, cv2.HISTCMP_CORREL)
+        self.prev_frame_hist = current_hist
 
-    # Each crop targets half height (9:8), but preserve input aspect for scaling
-    crop_h = min(frame_h, int(frame_w / (ASPECT_RATIO * 2)))
-    crop_w = int(crop_h * ASPECT_RATIO)
-    margin_w = int(crop_w * MARGIN_FACTOR)
-    margin_h = int(crop_h * MARGIN_FACTOR)
+        return correlation < self.scene_cut_threshold
 
-    crops = []
-    new_crop_flags = []
-    for idx, (x_min, y_min, x_max, y_max) in enumerate([top_bbox, bottom_bbox]):
-        x_center = (x_min + x_max) // 2
-        y_center = (y_min + y_max) // 2
-        x_min = max(0, x_min - margin_w)
-        x_max = min(frame_w, x_max + margin_w)
-        y_min = max(0, y_min - margin_h)
-        y_max = min(frame_h, y_max + margin_h)
+    def _is_bbox_in_crop(self, bbox, crop_box):
+        """Checks if the center of a bounding box is inside a crop box."""
+        if not bbox or not crop_box:
+            return False
+        
+        face_cx = bbox[0] + bbox[2] / 2
+        face_cy = bbox[1] + bbox[3] / 2
+        
+        crop_cx, crop_cy, crop_w, crop_h = crop_box
+        crop_xmin = crop_cx - crop_w / 2
+        crop_xmax = crop_cx + crop_w / 2
+        crop_ymin = crop_cy - crop_h / 2
+        crop_ymax = crop_cy + crop_h / 2
+        
+        return (crop_xmin < face_cx < crop_xmax) and \
+               (crop_ymin < face_cy < crop_ymax)
 
-        # Check if previous crop exists and is not from no faces
-        if (prev_crops and len(prev_crops) > idx and isinstance(prev_crops[idx], tuple) and
-                prev_face_count > 0 and prev_crops[0] != (0, 0, frame_w, frame_h)):
-            px_min, py_min, px_max, py_max = prev_crops[idx]
-            if (x_min >= px_min and x_max <= px_max and
-                    y_min >= py_min and y_max <= py_max):
-                logger.debug(f"Reusing previous crop for face {idx}")
-                crops.append(prev_crops[idx])
-                new_crop_flags.append(False)
-                continue
+    def _get_face_bboxes(self, detections, source_width, source_height):
+        """Helper to get absolute pixel bounding boxes from detection results."""
+        if not detections: return []
+        bboxes = []
+        for d in detections:
+            box = d.location_data.relative_bounding_box
+            x = int(box.xmin * source_width)
+            y = int(box.ymin * source_height)
+            w = int(box.width * source_width)
+            h = int(box.height * source_height)
+            bboxes.append((x, y, w, h))
+        return bboxes
 
-        # Compute new crop
-        x_crop = x_center - crop_w // 2
-        y_crop = y_center - crop_h // 2
-        x_crop = max(0, min(frame_w - crop_w, x_crop))
-        y_crop = max(0, min(frame_h - crop_h, y_crop))
-        crop = (x_crop, y_crop, x_crop + crop_w, y_crop + crop_h)
-        crops.append(crop)
-        new_crop_flags.append(True)
-        logger.debug(f"New crop for face {idx}: {crop}")
+    def _calculate_target_crop(self, bboxes):
+        """Calculates the ideal target crop box for the current frame based on face bboxes."""
+        if not bboxes:
+            return (self.original_width / 2, self.original_height / 2, self.original_width, self.original_height)
 
-    if prev_face_count == 0:
-        logger.debug("Reset crops due to transition from no faces to 2 faces")
-    return crops, new_crop_flags
+        if len(bboxes) == 1:
+            x, y, w, h = bboxes[0]
+            face_cx, face_cy = x + w / 2, y + h / 2
+            crop_h = self.original_height
+            crop_w = int(crop_h * self.output_aspect_ratio)
+            if crop_w > self.original_width:
+                crop_w = self.original_width
+                crop_h = int(crop_w / self.output_aspect_ratio)
+            return (face_cx, face_cy, crop_w, crop_h)
 
-def compute_crop_multiple_faces(bboxes, frame_shape, prev_crops, prev_face_count):
-    """Compute a single crop encompassing multiple faces, resetting if previous crop was for no faces."""
-    logger.debug(f"Computing crop for {len(bboxes)} faces")
-    frame_w, frame_h = frame_shape
-    x_mins = [b[0] for b in bboxes]
-    y_mins = [b[1] for b in bboxes]
-    x_maxs = [b[2] for b in bboxes]
-    y_maxs = [b[3] for b in bboxes]
-    x_min = min(x_mins)
-    y_min = min(y_mins)
-    x_max = max(x_maxs)
-    y_max = max(y_maxs)
+        all_x = [b[0] for b in bboxes] + [b[0] + b[2] for b in bboxes]
+        all_y = [b[1] for b in bboxes] + [b[1] + b[3] for b in bboxes]
+        
+        faces_xmin, faces_xmax = min(all_x), max(all_x)
+        faces_ymin, faces_ymax = min(all_y), max(all_y)
+        
+        cx, cy = (faces_xmin + faces_xmax) / 2, (faces_ymin + faces_ymax) / 2
+        w, h = faces_xmax - faces_xmin, faces_ymax - faces_ymin
 
-    # Calculate crop dimensions (target 9:16 but preserve input aspect for scaling)
-    crop_h = min(frame_h, int(frame_w / ASPECT_RATIO))
-    crop_w = int(crop_h * ASPECT_RATIO)
-    margin_w = int(crop_w * MARGIN_FACTOR)
-    margin_h = int(crop_h * MARGIN_FACTOR)
+        if h == 0 or w == 0: return self._calculate_target_crop(None)
 
-    # Expand with margin
-    x_min = max(0, x_min - margin_w)
-    x_max = min(frame_w, x_max + margin_w)
-    y_min = max(0, y_min - margin_h)
-    y_max = min(frame_h, y_max + margin_h)
+        if w / h > self.output_aspect_ratio:
+            final_h = w / self.output_aspect_ratio
+            final_w = w
+        else:
+            final_w = h * self.output_aspect_ratio
+            final_h = h
 
-    # Check if all faces are within previous crop and not from no faces
-    if (prev_crops and len(prev_crops) > 0 and isinstance(prev_crops[0], tuple) and
-            prev_face_count > 0 and prev_crops[0] != (0, 0, frame_w, frame_h)):
-        px_min, py_min, px_max, py_max = prev_crops[0]
-        all_within = all(px_min <= x_mins[i] and x_maxs[i] <= px_max and
-                         py_min <= y_mins[i] and y_maxs[i] <= py_max
-                         for i in range(len(bboxes)))
-        if all_within:
-            logger.debug("Reusing previous crop for multiple faces")
-            return [prev_crops[0]], False
+        return (cx, cy, final_w * 1.4, final_h * 1.4)
 
-    # Compute new crop to encompass all faces
-    x_center = (x_min + x_max) // 2
-    y_center = (y_min + y_max) // 2
-    x_crop = x_center - crop_w // 2
-    y_crop = y_center - crop_h // 2
-    x_crop = max(0, min(frame_w - crop_w, x_crop))
-    y_crop = max(0, min(frame_h - crop_h, y_crop))
-    crop = (x_crop, y_crop, x_crop + crop_w, y_crop + crop_h)
-    logger.debug(f"New crop for multiple faces: {crop}")
-    if prev_face_count == 0:
-        logger.debug(f"Reset crop due to transition from no faces to {len(bboxes)} faces")
-    return [crop], True
+    def _apply_smoothing_and_inertia(self, target_box, last_box_state):
+        """Applies inertia and EMA smoothing to a crop box."""
+        if last_box_state is None:
+            return target_box
 
-def compute_center_crop(frame_shape):
-    """Use the full frame for no faces case."""
-    logger.debug("Computing full frame for no faces")
-    frame_w, frame_h = frame_shape
-    crop = (0, 0, frame_w, frame_h)
-    logger.debug(f"Full frame crop: {crop}")
-    return [crop], True
+        last_cx, last_cy, last_w, last_h = last_box_state
+        target_cx, target_cy, target_w, target_h = target_box
+        
+        dead_zone_w = last_w * self.inertia_zone
+        dead_zone_h = last_h * self.inertia_zone
+        
+        x_in_zone = abs(target_cx - last_cx) < dead_zone_w / 2
+        y_in_zone = abs(target_cy - last_cy) < dead_zone_h / 2
 
-def smooth_crop(current_crop, prev_smooth_crop):
-    """Apply exponential moving average to smooth crop coordinates."""
-    if prev_smooth_crop is None:
-        logger.debug("No previous smooth crop, using current")
-        return current_crop
-    x_min, y_min, x_max, y_max = current_crop
-    px_min, py_min, px_max, py_max = prev_smooth_crop
-    x_min = int(SMOOTHING_ALPHA * x_min + (1 - SMOOTHING_ALPHA) * px_min)
-    y_min = int(SMOOTHING_ALPHA * y_min + (1 - SMOOTHING_ALPHA) * py_min)
-    x_max = int(SMOOTHING_ALPHA * x_max + (1 - SMOOTHING_ALPHA) * px_max)
-    y_max = int(SMOOTHING_ALPHA * y_max + (1 - SMOOTHING_ALPHA) * py_max)
-    logger.debug(f"Smoothed crop: ({x_min}, {y_min}, {x_max}, {y_max})")
-    return (x_min, y_min, x_max, y_max)
+        if x_in_zone and y_in_zone:
+            return last_box_state
+        
+        alpha = self.smoothing_factor
+        smooth_cx = alpha * target_cx + (1 - alpha) * last_cx
+        smooth_cy = alpha * target_cy + (1 - alpha) * last_cy
+        smooth_w = alpha * target_w + (1 - alpha) * last_w
+        smooth_h = alpha * target_h + (1 - alpha) * last_h
+        
+        return (smooth_cx, smooth_cy, smooth_w, smooth_h)
 
-def create_blurred_background(frame, target_w, target_h):
-    """Create a blurred, darkened background from the input frame, preserving aspect ratio."""
-    logger.debug(f"Creating blurred background: {target_w}x{target_h}")
-    frame_h, frame_w = frame.shape[:2]
-    blurred = cv2.GaussianBlur(frame, BLUR_KERNEL, 0)
+    def _place_sub_frame(self, main_frame, sub_frame, region_box):
+        """Places a sub-frame into a region, resizing to fit with aspect ratio preserved."""
+        if sub_frame is None or sub_frame.shape[0] == 0 or sub_frame.shape[1] == 0: return
+        rx, ry, rw, rh = region_box
+        sh, sw, _ = sub_frame.shape
+
+        scale = min(rw / sw, rh / sh)
+        new_w, new_h = int(sw * scale), int(sh * scale)
+        if new_w <= 0 or new_h <= 0: return
+            
+        resized_sub = cv2.resize(sub_frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        x_offset = rx + (rw - new_w) // 2
+        y_offset = ry + (rh - new_h) // 2
+        main_frame[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized_sub
+
+    def _get_crop_from_box(self, frame, box):
+        """Safely crops the frame using a (cx, cy, w, h) box."""
+        if box is None: return None
+        cx, cy, w, h = box
+        x_min = max(0, int(cx - w / 2))
+        y_min = max(0, int(cy - h / 2))
+        x_max = min(self.original_width, int(cx + w / 2))
+        y_max = min(self.original_height, int(cy + h / 2))
+        if x_max <= x_min or y_max <= y_min: return None
+        return frame[y_min:y_max, x_min:x_max]
+
+    def _calculate_zoomed_out_face_target(self, bbox):
+        """Calculates a WIDE, zoomed-out crop target for a single face."""
+        x, y, w, h = bbox
+        half_screen_ar = (self.output_width) / (self.output_height / 2)
+        
+        padding_multiplier = 3.0 
+        
+        if w / h > half_screen_ar:
+            crop_w = w * padding_multiplier
+            crop_h = crop_w / half_screen_ar
+        else:
+            crop_h = h * padding_multiplier
+            crop_w = crop_h * half_screen_ar
+        
+        return (x + w / 2, y + h / 2, crop_w, crop_h)
+
+    def process_video(self):
+        """Main processing loop."""
+        logging.info("Starting video processing...")
+        start_time = time.time()
+        
+        input_audio = ffmpeg.input(self.input_path).audio
+        process = (
+            ffmpeg.input('pipe:', format='rawvideo', pix_fmt='bgr24', s=f'{self.output_width}x{self.output_height}', r=self.fps)
+            .output(input_audio, self.output_path, pix_fmt='yuv420p', vcodec='libx264', acodec='copy')
+            .overwrite_output()
+            .run_async(pipe_stdin=True)
+        )
+
+        frame_count = 0
+        while self.cap.isOpened():
+            success, frame = self.cap.read()
+            if not success: break
+
+            # --- Pre-processing for Detection ---
+            frame_for_detection = frame
+            detection_width, detection_height = self.original_width, self.original_height
+            if self.upscale_factor > 1.0:
+                d_w = int(self.original_width * self.upscale_factor)
+                d_h = int(self.original_height * self.upscale_factor)
+                frame_for_detection = cv2.resize(frame, (d_w, d_h), interpolation=cv2.INTER_CUBIC)
+                sharpen_kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+                frame_for_detection = cv2.filter2D(frame_for_detection, -1, sharpen_kernel)
+                detection_width, detection_height = d_w, d_h
+
+            # --- Face Detection ---
+            rgb_frame = cv2.cvtColor(frame_for_detection, cv2.COLOR_BGR2RGB)
+            results = self.face_detection.process(rgb_frame)
+            bboxes = self._get_face_bboxes(results.detections, detection_width, detection_height)
+            if self.upscale_factor > 1.0:
+                bboxes = [(int(x / self.upscale_factor), int(y / self.upscale_factor), 
+                           int(w / self.upscale_factor), int(h / self.upscale_factor)) 
+                          for x, y, w, h in bboxes]
+
+            if self.debug_mode:
+                for (x, y, w, h) in bboxes:
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 4)
+
+            # --- Scene Cut Detection and Mode Logic ---
+            is_scene_cut = self._detect_scene_cut(frame, frame_count) if self.scene_cut_threshold < 1.0 else False
+            detected_mode = '2_face' if len(bboxes) == 2 else 'general'
+
+            if is_scene_cut:
+                # Check if we should override the reset
+                should_override_reset = False
+                if len(bboxes) == self.last_face_count:
+                    if len(bboxes) == 1 and self._is_bbox_in_crop(bboxes[0], self.last_general_crop_box):
+                        should_override_reset = True
+                    elif len(bboxes) == 2:
+                        sorted_bboxes = sorted(bboxes, key=lambda b: b[0])
+                        if self._is_bbox_in_crop(sorted_bboxes[0], self.last_top_crop_box) and \
+                           self._is_bbox_in_crop(sorted_bboxes[1], self.last_bottom_crop_box):
+                            should_override_reset = True
+                
+                if not should_override_reset:
+                    logging.info(f"SCENE CUT DETECTED at frame {frame_count}. Resetting camera and forcing mode to '{detected_mode}'.")
+                    self.active_mode = detected_mode
+                    self.candidate_mode = detected_mode
+                    self.mode_confirmation_counter = 1
+                    self.last_general_crop_box = None
+                    self.last_top_crop_box = None
+                    self.last_bottom_crop_box = None
+                else:
+                    logging.info(f"Scene cut detected at frame {frame_count}, but overriding reset as subjects are stable.")
+            
+            # Standard temporal filtering for mode changes within a scene
+            if not is_scene_cut:
+                if detected_mode == self.candidate_mode:
+                    self.mode_confirmation_counter += 1
+                else:
+                    self.candidate_mode = detected_mode
+                    self.mode_confirmation_counter = 1
+
+                threshold = self.exit_threshold if self.active_mode == '2_face' else self.enter_threshold
+                if self.candidate_mode != self.active_mode and self.mode_confirmation_counter >= threshold:
+                    logging.info(f"CONFIRMED mode change from '{self.active_mode}' to '{self.candidate_mode}' at frame {frame_count}")
+                    self.active_mode = self.candidate_mode
+                    self.last_general_crop_box = None
+                    self.last_top_crop_box = None
+                    self.last_bottom_crop_box = None
+
+            # --- Create final frame based on the STABLE active mode ---
+            background = cv2.resize(frame, (self.output_width, self.output_height))
+            background = cv2.GaussianBlur(background, (51, 51), 0)
+            background = cv2.addWeighted(background, 0.4, np.zeros_like(background), 0.6, 0)
+
+            if self.active_mode == '2_face':
+                if len(bboxes) == 2:
+                    bboxes.sort(key=lambda b: b[0])
+                    self.current_left_bbox, self.current_right_bbox = bboxes
+                if hasattr(self, 'current_left_bbox'):
+                    top_target = self._calculate_zoomed_out_face_target(self.current_left_bbox)
+                    self.last_top_crop_box = self._apply_smoothing_and_inertia(top_target, self.last_top_crop_box)
+                    top_crop = self._get_crop_from_box(frame, self.last_top_crop_box)
+                    
+                    bottom_target = self._calculate_zoomed_out_face_target(self.current_right_bbox)
+                    self.last_bottom_crop_box = self._apply_smoothing_and_inertia(bottom_target, self.last_bottom_crop_box)
+                    bottom_crop = self._get_crop_from_box(frame, self.last_bottom_crop_box)
+
+                    top_region_h = self.output_height // 2
+                    self._place_sub_frame(background, top_crop, (0, 0, self.output_width, top_region_h))
+                    self._place_sub_frame(background, bottom_crop, (0, top_region_h, self.output_width, self.output_height - top_region_h))
+            
+            if self.active_mode == 'general':
+                target_box = self._calculate_target_crop(bboxes)
+                self.last_general_crop_box = self._apply_smoothing_and_inertia(target_box, self.last_general_crop_box)
+                final_crop = self._get_crop_from_box(frame, self.last_general_crop_box)
+                self._place_sub_frame(background, final_crop, (0, 0, self.output_width, self.output_height))
+
+            process.stdin.write(background.tobytes())
+            frame_count += 1
+            self.last_face_count = len(bboxes) # Update face count for the next frame's check
+            if frame_count % 150 == 0:
+                logging.info(f"Processed frame {frame_count}/{self.total_frames}. Active mode: '{self.active_mode}'")
+
+        logging.info("Cleaning up resources.")
+        self.cap.release()
+        process.stdin.close()
+        process.wait()
+        self.face_detection.close()
+        logging.info(f"Video processing complete. Output saved to {self.output_path}")
+
+def main():
+    parser = argparse.ArgumentParser(description="Crop a video to a 9:16 aspect ratio with smooth, stabilized camera motion.")
+    parser.add_argument("input_video", help="Path to the input video file.")
+    parser.add_argument("output_video", help="Path for the processed output video file.")
+    parser.add_argument("--smoothing", type=float, default=0.07, help="Smoothing factor (0-1). Lower is smoother. Default: 0.07")
+    parser.add_argument("--inertia", type=float, default=0.7, help="Inertia zone (0-1). Higher means less reactive. Default: 0.7")
+    parser.add_argument("--enter-threshold", type=int, default=5, help="Frames to confirm a new mode before switching. Default: 5")
+    parser.add_argument("--exit-threshold", type=int, default=15, help="Frames to wait before exiting a mode after faces are lost. Default: 15")
+    parser.add_argument("--debug", action="store_true", help="Enable debug mode to draw face bounding boxes on the output video.")
+    parser.add_argument("--upscale", type=float, default=1.0, help="Factor to upscale frames before detection for small faces (e.g., 1.5). Default: 1.0 (no upscale).")
+    parser.add_argument("--confidence", type=float, default=0.5, help="Minimum face detection confidence (0.0-1.0). Lower to detect more distant faces. Default: 0.5")
+    parser.add_argument("--scene-cut-threshold", type=float, default=0.99, help="Threshold for scene cut detection (0.0-1.0). Lower is more sensitive. Try 0.6. Default: 0.99 (mostly disabled).")
     
-    # Darken the blurred frame
-    darkened = cv2.convertScaleAbs(blurred, alpha=DARKEN_FACTOR, beta=0)
-    logger.debug(f"Applied darkening with factor {DARKEN_FACTOR}")
-
-    # Scale to cover target dimensions without stretching
-    frame_aspect = frame_w / frame_h
-    target_aspect = target_w / target_h
-    if frame_aspect > target_aspect:
-        # Frame is wider: scale by height to cover target height
-        scale = target_h / frame_h
-    else:
-        # Frame is taller: scale by width to cover target width
-        scale = target_w / frame_w
-
-    new_w = int(frame_w * scale)
-    new_h = int(frame_h * scale)
-    logger.debug(f"Scaling blurred frame {frame_w}x{frame_h} to {new_w}x{new_h} (scale: {scale:.2f})")
-
-    # Resize blurred frame
-    scaled_blurred = cv2.resize(darkened, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
-    # Crop to target dimensions
-    offset_x = (new_w - target_w) // 2
-    offset_y = (new_h - target_h) // 2
-    logger.debug(f"Cropping blurred frame at offset ({offset_x}, {offset_y})")
-
-    x1 = max(0, offset_x)
-    y1 = max(0, offset_y)
-    x2 = min(new_w, offset_x + target_w)
-    y2 = min(new_h, offset_y + target_h)
-    background = np.zeros((target_h, target_w, 3), dtype=np.uint8)
-    background[0:y2-y1, 0:x2-x1] = scaled_blurred[y1:y2, x1:x2]
-    return background
-
-def place_crop_on_background(crop_frame, target_w, target_h, background):
-    """Scale crop to fit target dimensions without stretching, place on background."""
-    crop_h, crop_w = crop_frame.shape[:2]
-    crop_aspect = crop_w / crop_h
-    target_aspect = target_w / target_h
-
-    # Scale to fit while preserving aspect ratio
-    if crop_aspect > target_aspect:
-        # Crop is wider: scale by width
-        scale = target_w / crop_w
-    else:
-        # Crop is taller: scale by height
-        scale = target_h / crop_h
-
-    new_w = int(crop_w * scale)
-    new_h = int(crop_h * scale)
-    logger.debug(f"Scaling crop {crop_w}x{crop_h} to {new_w}x{new_h} (scale: {scale:.2f})")
-
-    # Resize crop
-    scaled_crop = cv2.resize(crop_frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
-    # Create output frame with background
-    output_frame = background.copy()
-    offset_x = (target_w - new_w) // 2
-    offset_y = (target_h - new_h) // 2
-    logger.debug(f"Placing crop at offset ({offset_x}, {offset_y})")
-
-    # Ensure offsets and dimensions are within bounds
-    x1 = max(0, offset_x)
-    y1 = max(0, offset_y)
-    x2 = min(target_w, offset_x + new_w)
-    y2 = min(target_h, offset_y + new_h)
-    crop_x1 = max(0, -offset_x)
-    crop_y1 = max(0, -offset_y)
-    crop_x2 = crop_x1 + (x2 - x1)
-    crop_y2 = crop_y1 + (y2 - y1)
-
-    # Place crop on background
-    output_frame[y1:y2, x1:x2] = scaled_crop[crop_y1:crop_y2, crop_x1:crop_x2]
-    return output_frame
-
-def process_frame(frame, bboxes, prev_crops, prev_smooth_crops, frame_shape, prev_face_count):
-    """Process a single frame based on number of faces."""
-    logger.debug(f"Processing frame with {len(bboxes)} faces (previous: {prev_face_count})")
-    frame_w, frame_h = frame_shape
-
-    # Compute crops
-    if len(bboxes) == 0:
-        # No faces: use full frame
-        crops, new_crop = compute_center_crop(frame_shape)
-    elif len(bboxes) == 1:
-        # One face: center on face
-        crops, new_crop = compute_crop_1_face(bboxes[0], frame_shape, prev_crops, prev_face_count)
-    elif len(bboxes) == 2:
-        # Two faces: split frame
-        crops, new_crop_flags = compute_crop_2_faces(bboxes, frame_shape, prev_crops, prev_face_count)
-        new_crop = any(new_crop_flags)
-    else:
-        # Multiple faces: encompass all
-        crops, new_crop = compute_crop_multiple_faces(bboxes, frame_shape, prev_crops, prev_face_count)
-
-    # Smooth crops if new and not transitioning from no faces
-    if new_crop and prev_face_count > 0:
-        smoothed_crops = [
-            smooth_crop(c, prev_smooth_crops[i] if prev_smooth_crops and i < len(prev_smooth_crops) else None)
-            for i, c in enumerate(crops)
-        ]
-    else:
-        smoothed_crops = crops
-        if prev_face_count == 0 and len(bboxes) > 0:
-            logger.debug("Skipping smoothing due to transition from no faces")
-        else:
-            logger.debug("No new crop or no faces, using current crops")
-
-    # Create output frame
-    output_frame = np.zeros((OUTPUT_HEIGHT, OUTPUT_WIDTH, 3), dtype=np.uint8)
-    background = create_blurred_background(frame, OUTPUT_WIDTH, OUTPUT_HEIGHT)
-
-    if len(bboxes) == 2:
-        # Two faces: process each crop for half the frame
-        for idx, (x_min, y_min, x_max, y_max) in enumerate(smoothed_crops):
-            crop_frame = frame[y_min:y_max, x_min:x_max]
-            target_h = OUTPUT_HEIGHT // 2
-            target_w = OUTPUT_WIDTH
-            # Create half-sized background for this crop
-            half_background = create_blurred_background(frame, target_w, target_h)
-            half_frame = place_crop_on_background(crop_frame, target_w, target_h, half_background)
-            y_offset = idx * target_h
-            output_frame[y_offset:y_offset + target_h, :] = half_frame
-            logger.debug(f"Applied crop {idx} to half {y_offset}:{y_offset + target_h}")
-    else:
-        # No faces, one face, or multiple faces: single crop
-        x_min, y_min, x_max, y_max = smoothed_crops[0]
-        crop_frame = frame[y_min:y_max, x_min:x_max]
-        output_frame = place_crop_on_background(crop_frame, OUTPUT_WIDTH, OUTPUT_HEIGHT, background)
-        logger.debug(f"Applied single crop: ({x_min}, {y_min}, {x_max}, {y_max})")
-
-    return output_frame, smoothed_crops, new_crop, len(bboxes)
-
-def merge_audio_video(input_video, temp_video, output_video):
-    """Merge audio from input video with processed video using ffmpeg."""
-    logger.info(f"Merging audio from {input_video} to {output_video}")
+    args = parser.parse_args()
     try:
-        input_stream = ffmpeg.input(input_video)
-        video_stream = ffmpeg.input(temp_video)
-        audio = input_stream.audio
-        video = video_stream.video
-        output = ffmpeg.output(video, audio, output_video, vcodec='copy', acodec='copy', **{'b:v': BITRATE})
-        ffmpeg.run(output, overwrite_output=True)
-        logger.info("Audio merged successfully")
-        os.remove(temp_video)
-        logger.debug(f"Removed temporary file {temp_video}")
-    except ffmpeg.Error as e:
-        logger.error(f"FFmpeg error: {e.stderr.decode()}")
-        raise
-
-def main(input_path, output_path):
-    """Main function to process video."""
-    logger.info(f"Starting video processing: input={input_path}, output={output_path}")
-    if not os.path.exists(input_path):
-        logger.error(f"Input video {input_path} does not exist")
-        sys.exit(1)
-
-    cap = cv2.VideoCapture(input_path)
-    if not cap.isOpened():
-        logger.error(f"Cannot open input video {input_path}")
-        sys.exit(1)
-
-    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    frame_shape = (frame_w, frame_h)
-    logger.info(f"Video info: width={frame_w}, height={frame_h}, fps={fps}, frames={frame_count}")
-
-    # Initialize video writer for temporary file
-    temp_output = '/data/temp_output.mp4'
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(temp_output, fourcc, fps, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
-    if not out.isOpened():
-        logger.error(f"Cannot create temporary video {temp_output}")
-        cap.release()
-        sys.exit(1)
-
-    prev_crops = None
-    prev_smooth_crops = None
-    last_bboxes = []
-    prev_face_count = 0
-    frame_idx = 0
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            logger.info("End of video reached")
-            break
-
-        logger.debug(f"Processing frame {frame_idx}")
-        # Detect faces every DETECTION_INTERVAL frames
-        if frame_idx % DETECTION_INTERVAL == 0:
-            bboxes = get_face_bboxes(frame)
-            last_bboxes = bboxes
-        else:
-            bboxes = last_bboxes
-            logger.debug(f"Reusing face bboxes from frame {frame_idx - (frame_idx % DETECTION_INTERVAL)}")
-
-        try:
-            output_frame, crops, new_crop, curr_face_count = process_frame(
-                frame, bboxes, prev_crops, prev_smooth_crops, frame_shape, prev_face_count
-            )
-        except Exception as e:
-            logger.error(f"Error processing frame {frame_idx}: {str(e)}")
-            cap.release()
-            out.release()
-            sys.exit(1)
-
-        out.write(output_frame)
-        prev_crops = crops
-        prev_smooth_crops = crops
-        prev_face_count = curr_face_count
-        frame_idx += 1
-
-    logger.info(f"Processed {frame_idx} frames")
-    cap.release()
-    out.release()
-    face_detection.close()
-
-    # Merge audio with video
-    merge_audio_video(input_path, temp_output, output_path)
-    logger.info("Video processing completed")
+        processor = VideoProcessor(args.input_video, args.output_video, 
+                                   smoothing_factor=args.smoothing, 
+                                   inertia_zone=args.inertia,
+                                   enter_threshold=args.enter_threshold,
+                                   exit_threshold=args.exit_threshold,
+                                   debug_mode=args.debug,
+                                   upscale_factor=args.upscale,
+                                   confidence=args.confidence,
+                                   scene_cut_threshold=args.scene_cut_threshold)
+        processor.process_video()
+    except (IOError, ValueError) as e:
+        logging.error(f"An error occurred: {e}")
+    except Exception as e:
+        logging.error(f"An unexpected error occurred: {e}", exc_info=True)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Convert video to 9:16 shorts with smart cropping.")
-    parser.add_argument("input_video", help="Path to input video")
-    parser.add_argument("output_video", help="Path to output video")
-    args = parser.parse_args()
-    main(args.input_video, args.output_video)
+    main()
+
