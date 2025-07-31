@@ -131,6 +131,29 @@ class VideoProcessor:
             h = int(box.height * source_height)
             bboxes.append((x, y, w, h))
         return bboxes
+    
+    def _create_non_stretched_background(self, frame):
+        """Creates a blurred background that covers the output dimensions without stretching."""
+        # Calculate scale factor, using the larger of the two to ensure coverage (overflow)
+        scale_w = self.output_width / self.original_width
+        scale_h = self.output_height / self.original_height
+        scale = max(scale_w, scale_h)
+
+        # New dimensions of the scaled frame
+        scaled_w = int(self.original_width * scale)
+        scaled_h = int(self.original_height * scale)
+
+        # Resize the frame preserving aspect ratio
+        resized_frame = cv2.resize(frame, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
+
+        # Calculate coordinates for a center crop
+        x_offset = (scaled_w - self.output_width) // 2
+        y_offset = (scaled_h - self.output_height) // 2
+
+        # Perform the center crop to get the final background size
+        background = resized_frame[y_offset:y_offset + self.output_height, x_offset:x_offset + self.output_width]
+        
+        return background
 
     def _calculate_target_crop(self, bboxes):
         """Calculates the ideal target crop box for the current frame based on face bboxes."""
@@ -320,7 +343,7 @@ class VideoProcessor:
                     self.last_bottom_crop_box = None
 
             # --- Create final frame based on the STABLE active mode ---
-            background = cv2.resize(frame, (self.output_width, self.output_height))
+            background = self._create_non_stretched_background(frame)
             background = cv2.GaussianBlur(background, (51, 51), 0)
             background = cv2.addWeighted(background, 0.4, np.zeros_like(background), 0.6, 0)
 
